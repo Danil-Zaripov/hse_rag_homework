@@ -9,7 +9,9 @@ def _document_pages(context):
     for document in context:
         for page in document["pages"]:
             if type(page) is not int or page < 1:
-                raise ValueError("Номера страниц PDF должны быть целыми числами начиная с 1.")
+                raise ValueError(
+                    "Номера страниц PDF должны быть целыми числами начиная с 1."
+                )
             pages.add((document["doc_id"], page))
     return pages
 
@@ -59,7 +61,10 @@ def score_answer(gold_answer, answer):
             "thinking": {"type": "disabled"},
             "system": JUDGE_PROMPT,
             "messages": [
-                {"role": "user", "content": f"gold_answer: {gold_answer}\nanswer: {answer}"},
+                {
+                    "role": "user",
+                    "content": f"gold_answer: {gold_answer}\nanswer: {answer}",
+                },
             ],
         },
         timeout=90,
@@ -72,6 +77,13 @@ def score_answer(gold_answer, answer):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     decision = json.loads(text)
     score, reason = decision["score"], decision["reason"]
-    if type(score) is not int or score not in (0, 1) or not isinstance(reason, str) or not reason.strip():
-        raise ValueError("От судьи ожидаются score (0 или 1) и непустое объяснение reason.")
+    if (
+        type(score) is not int
+        or score not in (0, 1)
+        or not isinstance(reason, str)
+        or not reason.strip()
+    ):
+        raise ValueError(
+            "От судьи ожидаются score (0 или 1) и непустое объяснение reason."
+        )
     return {"answer_correctness": score, "reason": reason}
