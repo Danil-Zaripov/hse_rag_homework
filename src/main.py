@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 import numpy as np
 import requests
 from dotenv import load_dotenv
 from langsmith import traceable as _traceable
 from pypdf import PdfReader
+from requests.models import CONTENT_CHUNK_SIZE
+
+try:
+    import fitz
+except ImportError:  # pragma: no cover - pypdf remains a supported fallback
+    fitz = None
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -24,6 +31,7 @@ REPORTS_DIR = DATA_DIR / "reports"
 DOCUMENTS_FILE = DATA_DIR / "documents.jsonl"
 INDEX_DIR = ROOT / "index"
 INDEX_CONFIG = INDEX_DIR / "config.json"
+INDEX_VERSION = "page-layout-v2"
 _LLM_LIMITER: RateLimiter | None = None
 
 
@@ -79,7 +87,9 @@ class CourseEmbeddings:
                 continue
             if response.status_code in (500, 502, 503, 504):
                 retries += 1
-                _status(f"Embedding service returned {response.status_code}; retry #{retries}.")
+                _status(
+                    f"Embedding service returned {response.status_code}; retry #{retries}."
+                )
                 time.sleep(_retry_delay(response, self.limiter.interval))
                 continue
             response.raise_for_status()
@@ -144,10 +154,36 @@ class EmbeddingIndex:
             return []
         query_vector /= norm
         scores = self.vectors @ query_vector
-        indices = np.argsort(scores)[::-1][:top_k]
-        return [
-            SearchResult(self.chunks[int(i)], float(scores[int(i)])) for i in indices
-        ]
+        candidate_count = min(len(self.chunks), max(top_k * 8, 32))
+        indices = np.argsort(scores)[::-1][:candidate_count]
+        query_terms = _terms(query)
+        query_years = set(re.findall(r"20\d{2}", query))
+        ranked: list[SearchResult] = []
+        for index in indices:
+            chunk = self.chunks[int(index)]
+            score = float(scores[int(index)])
+            chunk_terms = _terms(f"{chunk.doc_id} {chunk.organization} {chunk.text}")
+            lexical_overlap = len(query_terms & chunk_terms)
+            score += min(0.10, lexical_overlap * 0.01)
+            if query_years:
+                matching_year = any(year in chunk.doc_id for year in query_years)
+                score += 0.08 if matching_year else -0.015
+            ranked.append(SearchResult(chunk, score))
+        ranked.sort(key=lambda result: result.score, reverse=True)
+
+        # A page may contain several chunks. Returning only its best chunk
+        # prevents one long page from consuming the whole context budget.
+        selected: list[SearchResult] = []
+        seen_pages: set[tuple[str, int]] = set()
+        for result in ranked:
+            key = (result.chunk.doc_id, result.chunk.page)
+            if key in seen_pages:
+                continue
+            seen_pages.add(key)
+            selected.append(result)
+            if len(selected) == top_k:
+                break
+        return selected
 
     def save(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -157,7 +193,10 @@ class EmbeddingIndex:
         )
         np.save(directory / "vectors.npy", self.vectors)
         INDEX_CONFIG.write_text(
-            json.dumps({"embedding_model": "deepvk/USER-bge-m3"}, indent=2),
+            json.dumps(
+                {"version": INDEX_VERSION, "embedding_model": "deepvk/USER-bge-m3"},
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
@@ -182,6 +221,14 @@ def _read_document_metadata() -> dict[str, dict[str, str]]:
     return metadata
 
 
+def _terms(text: str) -> set[str]:
+    return {
+        term.lower()
+        for term in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text)
+        if len(term) > 2
+    }
+
+
 def _chunks_from_pdf(doc_id: str, metadata: Mapping[str, str]) -> list[PageChunk]:
     path = REPORTS_DIR / metadata["path"]
     if not path.exists():
@@ -189,19 +236,39 @@ def _chunks_from_pdf(doc_id: str, metadata: Mapping[str, str]) -> list[PageChunk
             f"Report {doc_id} is missing: {path}. Extract data/reports.zip into data/reports."
         )
     chunks: list[PageChunk] = []
-    reader = PdfReader(str(path))
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or "").strip()
+    if fitz is not None:
+        pdf = fitz.open(str(path))
+        pages: Iterable[tuple[int, str | None]] = (
+            (page_number, pdf[page_number - 1].get_text("text", sort=True))
+            for page_number in range(1, len(pdf) + 1)
+        )
+    else:
+        reader = PdfReader(str(path))
+        extracted_pages: list[tuple[int, str | None]] = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            try:
+                text = page.extract_text(extraction_mode="layout")
+            except TypeError:
+                text = page.extract_text()
+            extracted_pages.append((page_number, text))
+        pages = extracted_pages
+    for page_number, raw_text in pages:
+        text = (raw_text or "").strip()
         if not text:
             continue
         # A page is a useful unit for financial tables because it preserves
         # the page metadata required by the evaluator.
-        for start in range(0, len(text), 2200):
-            piece = text[start : start + 2400].strip()
+
+        CHUNK_SIZE = 5000
+        OVERLAP = 200
+        for start in range(0, len(text), CHUNK_SIZE):
+            piece = text[start : start + (CHUNK_SIZE + OVERLAP)].strip()
             if piece:
                 chunks.append(
                     PageChunk(doc_id, page_number, metadata["organization"], piece)
                 )
+    if fitz is not None:
+        pdf.close()
     return chunks
 
 
@@ -213,6 +280,8 @@ def build_index(force: bool = False) -> EmbeddingIndex:
         and (INDEX_DIR / "chunks.json").exists()
         and (INDEX_DIR / "vectors.npy").exists()
         and INDEX_CONFIG.exists()
+        and json.loads(INDEX_CONFIG.read_text(encoding="utf-8")).get("version")
+        == INDEX_VERSION
     ):
         _status("Loading existing index from index/.")
         return EmbeddingIndex.load(INDEX_DIR)
@@ -271,6 +340,14 @@ class RateLimiter:
             time.sleep(delay)
 
 
+def get_llm_limiter() -> RateLimiter:
+    """Return the process-wide limiter shared by answers and evaluation."""
+    global _LLM_LIMITER
+    if _LLM_LIMITER is None:
+        _LLM_LIMITER = RateLimiter(int(os.getenv("LLM_RPM", "10")))
+    return _LLM_LIMITER
+
+
 def _retry_delay(response: requests.Response, fallback: float) -> float:
     retry_after = response.headers.get("Retry-After")
     if retry_after:
@@ -290,10 +367,7 @@ class GatewayModel:
         self.base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
         self.model = os.getenv("LLM_MODEL", "deepseek-flash")
         self.auth_scheme = os.getenv("LLM_AUTH_SCHEME", "x-api-key").lower()
-        global _LLM_LIMITER
-        if _LLM_LIMITER is None:
-            _LLM_LIMITER = RateLimiter(int(os.getenv("LLM_RPM", "10")))
-        self.limiter = _LLM_LIMITER
+        self.limiter = get_llm_limiter()
 
     def generate(self, question: str, context: Sequence[SearchResult]) -> str:
         if not self.api_key:

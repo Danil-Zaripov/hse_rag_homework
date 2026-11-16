@@ -2,6 +2,10 @@
 
 import json
 import os
+import sys
+import time
+
+from src.main import get_llm_limiter
 
 
 def _document_pages(context):
@@ -48,34 +52,67 @@ def score_answer(gold_answer, answer):
     """Получить answer_correctness и объяснение LLM-судьи для пары ответов."""
     import requests
 
-    response = requests.post(
-        "https://claude.gigaparsers.ru/v1/messages",
-        headers={
-            "x-api-key": os.environ["LLM_API_KEY"],
-            "anthropic-version": "2023-06-01",
-        },
-        json={
-            "model": "deepseek-flash",
-            "max_tokens": 512,
-            "temperature": 0,
-            "thinking": {"type": "disabled"},
-            "system": JUDGE_PROMPT,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": f"gold_answer: {gold_answer}\nanswer: {answer}",
-                },
-            ],
-        },
-        timeout=90,
-    )
-    response.raise_for_status()
+    while True:
+        get_llm_limiter().wait()
+        response = requests.post(
+            "https://claude.gigaparsers.ru/v1/messages",
+            headers={
+                "x-api-key": os.environ["LLM_API_KEY"],
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": "deepseek-flash",
+                "max_tokens": 512,
+                "temperature": 0,
+                "thinking": {"type": "disabled"},
+                "system": JUDGE_PROMPT,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"gold_answer: {gold_answer}\nanswer: {answer}",
+                    },
+                ],
+            },
+            timeout=90,
+        )
+        if response.status_code in (429, 500, 502, 503, 504):
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = max(float(retry_after or "30"), 30.0)
+            except ValueError:
+                delay = 30.0
+            print(
+                f"[eval] Judge returned HTTP {response.status_code}; "
+                f"waiting {delay:.0f}s.",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+            continue
+        response.raise_for_status()
+        break
     text = "".join(
         block["text"] for block in response.json()["content"] if block["type"] == "text"
     ).strip()
     if text.startswith("```") and text.endswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    decision = json.loads(text)
+    try:
+        decision = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                decision = json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                decision = {
+                    "score": 0,
+                    "reason": "Судья вернул некорректный JSON.",
+                }
+        else:
+            decision = {
+                "score": 0,
+                "reason": "Судья вернул ответ без JSON.",
+            }
     score, reason = decision["score"], decision["reason"]
     if (
         type(score) is not int
